@@ -25,7 +25,11 @@ parser.add_argument("--debug", action="store_true",
 parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/processed/"))
 parser.add_argument("--epochs",    type=int, default=10)
 parser.add_argument("--batch_size",type=int, default=4)
-parser.add_argument("--lr",        type=float, default=1e-5)
+parser.add_argument("--lr",          type=float, default=1e-5)
+parser.add_argument("--accum_steps", type=int,   default=4,
+                    help="Gradient accumulation steps. Effective batch = batch_size * accum_steps. "
+                         "Default 4 gives effective batch of 16, which stabilizes extraversion "
+                         "gradients (35%% positive rate is too noisy at bare batch_size=4).")
 args = parser.parse_args()
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -33,6 +37,7 @@ DATA_PATH    = args.data_path
 BATCH_SIZE   = 2 if args.debug else args.batch_size
 NUM_EPOCHS   = 1 if args.debug else args.epochs
 LR           = args.lr
+ACCUM_STEPS  = 1 if args.debug else args.accum_steps
 WARMUP_STEPS = 100
 DROPOUT      = 0.1
 DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -41,6 +46,7 @@ TRAIT_NAMES  = ["agreeableness", "openness", "conscientiousness",
 
 print(f"Device: {DEVICE}")
 print(f"Debug mode: {args.debug}")
+print(f"Effective batch size: {BATCH_SIZE} x {ACCUM_STEPS} accum = {BATCH_SIZE * ACCUM_STEPS}")
 print("-" * 60)
 
 # ── Load data ─────────────────────────────────────────────────────────────────
@@ -96,9 +102,14 @@ class AdaptiveFocalLoss(torch.nn.Module):
         # 3. Calculate Focal Factor: (1 - e^(-Z_BCE))^gamma
         focal_factor = torch.pow(1.0 - torch.exp(-pure_bce), gamma)
         
-        # 4. FBCE-T: focal_factor * weighted_bce + log(gamma)
-        loss = focal_factor * weighted_bce + self.log_gamma
-        
+        # 4. FBCE-T: focal_factor * weighted_bce + regularization on gamma
+        # Bug in original: "+ self.log_gamma" gets averaged across all batch*dim
+        # terms, shrinking the effective gradient to ~1e-5 — gamma barely moves.
+        # Fix: add as a scaled scalar so the gradient magnitude is meaningful.
+        sample_loss = focal_factor * weighted_bce
+        reg  = 0.01 * self.log_gamma
+        loss = sample_loss + reg
+
         # 5. FBCE-M: Average across all dimensions and batch samples
         return loss.mean()
 
@@ -109,14 +120,17 @@ model     = HTLA(dropout=DROPOUT).to(DEVICE)
 # Use the new Multi-Dimensional Adaptive Focal Loss
 criterion = AdaptiveFocalLoss(pos_weights=pos_weights).to(DEVICE)
 
-# Crucial: Pass BOTH the model's parameters and the loss function's parameters to the optimizer
+# Separate LR for gamma: BERT grads are ~1e-5 scale, but gamma is a single
+# scalar that needs a much higher LR to move meaningfully.
+# Using the same LR buries gamma's gradient under BERT's parameter mass.
 optimizer = AdamW(
-    list(model.parameters()) + list(criterion.parameters()), 
-    lr=LR, 
-    weight_decay=0.01
+    [
+        {"params": model.parameters(),     "lr": LR,     "weight_decay": 0.01},
+        {"params": criterion.parameters(), "lr": 1e-3,   "weight_decay": 0.0},
+    ]
 )
 
-total_steps = len(train_loader) * NUM_EPOCHS
+total_steps = len(train_loader) * NUM_EPOCHS // ACCUM_STEPS
 scheduler   = get_linear_schedule_with_warmup(
     optimizer,
     num_warmup_steps=min(WARMUP_STEPS, total_steps),
@@ -158,27 +172,21 @@ def evaluate(loader, desc="Evaluating"):
     return results
 
 # ── Training loop ─────────────────────────────────────────────────────────────
-best_val_f1 = 0.0
-history     = []
-patience_counter = 0  # Add this
-PATIENCE_LIMIT   = 3  # Stop if it doesn't improve for 3 epochs
-
-print(f"\nStarting training | {len(train_loader)} batches/epoch | {NUM_EPOCHS} epoch(s)")
-print("=" * 60)
-
-# ── Training loop ─────────────────────────────────────────────────────────────
 best_val_f1      = 0.0
 history          = []
-patience_counter = 0  # Counter for early stopping
-PATIENCE_LIMIT   = 3  # Stop training if F1 doesn't improve for 3 epochs
+patience_counter = 0
+PATIENCE_LIMIT   = 3
 
 print(f"\nStarting training | {len(train_loader)} batches/epoch | {NUM_EPOCHS} epoch(s)")
+print(f"Gradient accumulation: every {ACCUM_STEPS} steps (effective batch = {BATCH_SIZE * ACCUM_STEPS})")
 print("=" * 60)
 
 for epoch in range(1, NUM_EPOCHS + 1):
     model.train()
-    train_loss  = 0.0
-    train_bar   = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]")
+    train_loss = 0.0
+    train_bar  = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]")
+
+    optimizer.zero_grad()  # zero once before the loop, not inside
 
     for step, batch in enumerate(train_bar):
         ids   = batch["input_ids"].to(DEVICE)
@@ -186,16 +194,24 @@ for epoch in range(1, NUM_EPOCHS + 1):
         cmask = batch["comment_mask"].to(DEVICE)
         lbls  = batch["labels"].to(DEVICE)
 
-        optimizer.zero_grad()
         logits, _ = model(ids, masks, cmask)
-        loss      = criterion(logits, lbls)
+        # Scale loss by accum steps so gradients average correctly
+        loss = criterion(logits, lbls) / ACCUM_STEPS
         loss.backward()
-        
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        scheduler.step()
 
-        train_loss += loss.item()
+        train_loss += loss.item() * ACCUM_STEPS  # unscale for logging
+
+        # Only step when we've accumulated enough gradients
+        if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
+            # Clip grads for BOTH model and criterion (log_gamma included)
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()) + list(criterion.parameters()),
+                max_norm=1.0
+            )
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
         train_bar.set_postfix(loss=f"{train_loss/(step+1):.4f}")
 
         # Debug mode: stop after 2 batches
