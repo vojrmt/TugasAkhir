@@ -1,0 +1,6 @@
+data/processed/
+*.csv
+*.json
+
+data/raw/
+*.csv
