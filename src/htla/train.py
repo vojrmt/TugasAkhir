@@ -25,7 +25,7 @@ parser.add_argument("--debug", action="store_true",
 parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/processed/"))
 parser.add_argument("--epochs",    type=int, default=10)
 parser.add_argument("--batch_size",type=int, default=4)
-parser.add_argument("--lr",          type=float, default=1e-5)
+parser.add_argument("--lr",          type=float, default=1e-3)
 parser.add_argument("--accum_steps", type=int,   default=4,
                     help="Gradient accumulation steps. Effective batch = batch_size * accum_steps. "
                          "Default 4 gives effective batch of 16, which stabilizes extraversion "
@@ -138,7 +138,9 @@ scheduler   = get_linear_schedule_with_warmup(
 )
 
 # ── Eval ──────────────────────────────────────────────────────────────────────
-def evaluate(loader, desc="Evaluating"):
+def evaluate(loader, desc="Evaluating", thresholds=None):
+    if thresholds is None:
+        thresholds = [0.5] * len(TRAIT_NAMES)
     model.eval()
     all_preds, all_labels = [], []
     total_loss = 0.0
@@ -154,7 +156,11 @@ def evaluate(loader, desc="Evaluating"):
             loss      = criterion(logits, lbls)
             total_loss += loss.item()
 
-            preds = (torch.sigmoid(logits) >= 0.5).int().cpu().numpy()
+            probs = torch.sigmoid(logits).cpu().numpy()
+            preds = np.stack([
+                (probs[:, i] >= thresholds[i]).astype(int)
+                for i in range(len(TRAIT_NAMES))
+            ], axis=1)
             all_preds.append(preds)
             all_labels.append(lbls.int().cpu().numpy())
 
@@ -186,7 +192,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
     train_loss = 0.0
     train_bar  = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]")
 
-    optimizer.zero_grad()  # zero once before the loop, not inside
+    optimizer.zero_grad() 
 
     for step, batch in enumerate(train_bar):
         ids   = batch["input_ids"].to(DEVICE)
