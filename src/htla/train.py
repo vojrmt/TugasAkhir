@@ -23,9 +23,9 @@ parser.add_argument("--debug", action="store_true",
 # Set default path relative to train.py's location. 
 # Added a trailing slash "/" so your existing DATA_PATH + "filename.csv" code still works perfectly!
 parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/processed/"))
-parser.add_argument("--epochs",    type=int, default=10)
-parser.add_argument("--batch_size",type=int, default=4)
-parser.add_argument("--lr",          type=float, default=1e-5)
+parser.add_argument("--epochs",    type=int, default=20)
+parser.add_argument("--batch_size",type=int, default=5)
+parser.add_argument("--lr",          type=float, default=1e-3)
 parser.add_argument("--accum_steps", type=int,   default=4,
                     help="Gradient accumulation steps. Effective batch = batch_size * accum_steps. "
                          "Default 4 gives effective batch of 16, which stabilizes extraversion "
@@ -217,7 +217,7 @@ def evaluate(loader, desc="Evaluating", thresholds=None):
 best_val_f1      = 0.0
 history          = []
 patience_counter = 0
-PATIENCE_LIMIT   = 3
+PATIENCE_LIMIT   = 5
 
 print(f"\nStarting training | {len(train_loader)} batches/epoch | {NUM_EPOCHS} epoch(s)")
 print(f"Gradient accumulation: every {ACCUM_STEPS} steps (effective batch = {BATCH_SIZE * ACCUM_STEPS})")
