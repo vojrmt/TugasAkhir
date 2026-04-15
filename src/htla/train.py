@@ -25,7 +25,7 @@ parser.add_argument("--debug", action="store_true",
 parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/processed/"))
 parser.add_argument("--epochs",    type=int, default=10)
 parser.add_argument("--batch_size",type=int, default=4)
-parser.add_argument("--lr",          type=float, default=1e-3)
+parser.add_argument("--lr",          type=float, default=1e-5)
 parser.add_argument("--accum_steps", type=int,   default=4,
                     help="Gradient accumulation steps. Effective batch = batch_size * accum_steps. "
                          "Default 4 gives effective batch of 16, which stabilizes extraversion "
