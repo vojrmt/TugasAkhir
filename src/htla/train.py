@@ -7,7 +7,7 @@ import pandas as pd
 from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
-from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, balanced_accuracy_score
 from tqdm import tqdm
 from dataset import PANDORADataset
 from model import HTLA
@@ -138,6 +138,38 @@ scheduler   = get_linear_schedule_with_warmup(
 )
 
 # ── Eval ──────────────────────────────────────────────────────────────────────
+def find_best_thresholds(loader):
+    """Find per-trait thresholds that maximize F1 on the validation set."""
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Calibrating thresholds", leave=False):
+            ids   = batch["input_ids"].to(DEVICE)
+            masks = batch["attention_masks"].to(DEVICE)
+            cmask = batch["comment_mask"].to(DEVICE)
+            lbls  = batch["labels"].to(DEVICE)
+            
+            logits, _ = model(ids, masks, cmask)
+            all_probs.append(torch.sigmoid(logits).cpu().numpy())
+            all_labels.append(lbls.int().cpu().numpy())
+            
+    all_probs  = np.vstack(all_probs)
+    all_labels = np.vstack(all_labels)
+    
+    best_thresholds = []
+    print("\n  [Threshold Calibration Results]")
+    for i in range(len(TRAIT_NAMES)):
+        best_t, best_f1 = 0.5, 0.0
+        for t in np.arange(0.1, 0.9, 0.05):
+            preds = (all_probs[:, i] >= t).astype(int)
+            f1 = f1_score(all_labels[:, i], preds, zero_division=0)
+            if f1 > best_f1:
+                best_f1, best_t = f1, t
+        best_thresholds.append(best_t)
+        print(f"  {TRAIT_NAMES[i]:<20} best_threshold={best_t:.2f}  f1={best_f1:.4f}")
+        
+    return best_thresholds
+
 def evaluate(loader, desc="Evaluating", thresholds=None):
     if thresholds is None:
         thresholds = [0.5] * len(TRAIT_NAMES)
@@ -171,6 +203,7 @@ def evaluate(loader, desc="Evaluating", thresholds=None):
     for i, trait in enumerate(TRAIT_NAMES):
         results[trait] = {
             "accuracy":  round(accuracy_score (all_labels[:, i], all_preds[:, i]), 4),
+            "balanced_acc": round(balanced_accuracy_score(all_labels[:, i], all_preds[:, i]), 4),
             "f1":        round(f1_score       (all_labels[:, i], all_preds[:, i], zero_division=0), 4),
             "precision": round(precision_score(all_labels[:, i], all_preds[:, i], zero_division=0), 4),
             "recall":    round(recall_score   (all_labels[:, i], all_preds[:, i], zero_division=0), 4),
@@ -187,7 +220,19 @@ print(f"\nStarting training | {len(train_loader)} batches/epoch | {NUM_EPOCHS} e
 print(f"Gradient accumulation: every {ACCUM_STEPS} steps (effective batch = {BATCH_SIZE * ACCUM_STEPS})")
 print("=" * 60)
 
+FREEZE_EPOCHS = 2
+def set_bert_trainable(is_trainable):
+    for param in model.bert.parameters():
+        param.requires_grad = is_trainable
+    state = "UNFROZEN" if is_trainable else "FROZEN"
+    print(f"  [!] RoBERTa base model is now {state}")
+
 for epoch in range(1, NUM_EPOCHS + 1):
+    if epoch <= FREEZE_EPOCHS:
+        set_bert_trainable(False)
+    elif epoch == FREEZE_EPOCHS + 1:
+        set_bert_trainable(True)
+        
     model.train()
     train_loss = 0.0
     train_bar  = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]")
@@ -225,7 +270,10 @@ for epoch in range(1, NUM_EPOCHS + 1):
             print("\nDEBUG: 2 batches completed successfully. Stopping train loop.")
             break
 
-    val_results = evaluate(val_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [val]")
+    print("\n  Calibrating thresholds on val set...")
+    thresholds  = find_best_thresholds(val_loader)
+    val_results = evaluate(val_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [val]", thresholds=thresholds)
+    
     avg_f1      = sum(val_results[t]["f1"] for t in TRAIT_NAMES) / 5
 
     # Extract the current value of the trainable focal parameter (gamma)
@@ -237,7 +285,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
     
     for trait in TRAIT_NAMES:
         r = val_results[trait]
-        print(f"  {trait:<20} acc={r['accuracy']}  f1={r['f1']}  "
+        print(f"  {trait:<20} acc={r['accuracy']}  bal_acc={r['balanced_acc']}  f1={r['f1']}  "
               f"prec={r['precision']}  rec={r['recall']}")
 
     # Save gamma to history so you can plot it later if needed
