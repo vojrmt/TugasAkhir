@@ -159,14 +159,17 @@ def find_best_thresholds(loader):
     best_thresholds = []
     print("\n  [Threshold Calibration Results]")
     for i in range(len(TRAIT_NAMES)):
-        best_t, best_f1 = 0.5, 0.0
+        best_t, best_score = 0.5, 0.0
         for t in np.arange(0.1, 0.9, 0.05):
             preds = (all_probs[:, i] >= t).astype(int)
-            f1 = f1_score(all_labels[:, i], preds, zero_division=0)
-            if f1 > best_f1:
-                best_f1, best_t = f1, t
+            
+            # --- NEW: Optimize for Balanced Accuracy instead of F1 ---
+            b_acc = balanced_accuracy_score(all_labels[:, i], preds)
+            
+            if b_acc > best_score:
+                best_score, best_t = b_acc, t
         best_thresholds.append(best_t)
-        print(f"  {TRAIT_NAMES[i]:<20} best_threshold={best_t:.2f}  f1={best_f1:.4f}")
+        print(f"  {TRAIT_NAMES[i]:<20} best_threshold={best_t:.2f}  bal_acc={best_score:.4f}")
         
     return best_thresholds
 
