@@ -89,29 +89,13 @@ class AdaptiveFocalLoss(torch.nn.Module):
         self.log_gamma = torch.nn.Parameter(torch.tensor(0.693)) 
 
     def forward(self, logits, targets):
-        # 1. Calculate standard unweighted BCE for the focal factor (Z_BCE in the paper)
-        pure_bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        
-        # 2. Calculate the weighted BCE (w * Z_BCE)
+        pure_bce    = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
         weighted_bce = F.binary_cross_entropy_with_logits(
             logits, targets, pos_weight=self.pos_weights, reduction='none'
         )
-        
-        gamma = torch.exp(self.log_gamma)
-        
-        # 3. Calculate Focal Factor: (1 - e^(-Z_BCE))^gamma
+        gamma        = torch.exp(self.log_gamma)
         focal_factor = torch.pow(1.0 - torch.exp(-pure_bce), gamma)
-        
-        # 4. FBCE-T: focal_factor * weighted_bce + regularization on gamma
-        # Bug in original: "+ self.log_gamma" gets averaged across all batch*dim
-        # terms, shrinking the effective gradient to ~1e-5 — gamma barely moves.
-        # Fix: add as a scaled scalar so the gradient magnitude is meaningful.
-        sample_loss = focal_factor * weighted_bce
-        reg  = 0.01 * self.log_gamma
-        loss = sample_loss + reg
-
-        # 5. FBCE-M: Average across all dimensions and batch samples
-        return loss.mean()
+        return (focal_factor * weighted_bce).mean()
 
 # ── Model, loss, optimizer ────────────────────────────────────────────────────
 print("\nLoading model...")
@@ -162,13 +146,12 @@ def find_best_thresholds(loader):
         best_t, best_score = 0.5, 0.0
         for t in np.arange(0.1, 0.9, 0.05):
             preds = (all_probs[:, i] >= t).astype(int)
-            
-            # --- NEW: Optimize for Balanced Accuracy instead of F1 ---
+            # Skip thresholds that predict all one class
+            if len(np.unique(preds)) < 2:
+                continue
             b_acc = balanced_accuracy_score(all_labels[:, i], preds)
-            
             if b_acc > best_score:
                 best_score, best_t = b_acc, t
-        best_thresholds.append(best_t)
         print(f"  {TRAIT_NAMES[i]:<20} best_threshold={best_t:.2f}  bal_acc={best_score:.4f}")
         
     return best_thresholds
@@ -192,6 +175,8 @@ def evaluate(loader, desc="Evaluating", thresholds=None):
             total_loss += loss.item()
 
             probs = torch.sigmoid(logits).cpu().numpy()
+            print(f"Mean prob per trait: {probs.mean(axis=0).round(3)}")
+
             preds = np.stack([
                 (probs[:, i] >= thresholds[i]).astype(int)
                 for i in range(len(TRAIT_NAMES))
