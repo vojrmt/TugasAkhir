@@ -123,7 +123,6 @@ scheduler   = get_linear_schedule_with_warmup(
 
 # ── Eval ──────────────────────────────────────────────────────────────────────
 def find_best_thresholds(loader):
-    """Find per-trait thresholds that maximize F1 on the validation set."""
     model.eval()
     all_probs, all_labels = [], []
     with torch.no_grad():
@@ -132,28 +131,27 @@ def find_best_thresholds(loader):
             masks = batch["attention_masks"].to(DEVICE)
             cmask = batch["comment_mask"].to(DEVICE)
             lbls  = batch["labels"].to(DEVICE)
-            
             logits, _ = model(ids, masks, cmask)
             all_probs.append(torch.sigmoid(logits).cpu().numpy())
             all_labels.append(lbls.int().cpu().numpy())
-            
+
     all_probs  = np.vstack(all_probs)
     all_labels = np.vstack(all_labels)
-    
+
     best_thresholds = []
     print("\n  [Threshold Calibration Results]")
     for i in range(len(TRAIT_NAMES)):
-        best_t, best_score = 0.5, 0.0
+        best_t, best_score = 0.5, 0.0  # fallback default
         for t in np.arange(0.1, 0.9, 0.05):
             preds = (all_probs[:, i] >= t).astype(int)
-            # Skip thresholds that predict all one class
-            if len(np.unique(preds)) < 2:
+            if len(np.unique(preds)) < 2:  # skip degenerate thresholds
                 continue
             b_acc = balanced_accuracy_score(all_labels[:, i], preds)
             if b_acc > best_score:
                 best_score, best_t = b_acc, t
+        best_thresholds.append(best_t)  # always appends, even if no t passed the guard
         print(f"  {TRAIT_NAMES[i]:<20} best_threshold={best_t:.2f}  bal_acc={best_score:.4f}")
-        
+
     return best_thresholds
 
 def evaluate(loader, desc="Evaluating", thresholds=None):
