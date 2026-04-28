@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModel
 
-BERT_MODEL = "roberta-base"
+BERT_MODEL = "bert-base-uncased"
 
 
 class LabelAttention(nn.Module):

@@ -7,7 +7,7 @@ from tqdm import tqdm
 BIG5_LABELS  = ["agreeableness_label", "openness_label",
                  "conscientiousness_label", "extraversion_label",
                  "neuroticism_label"]
-BERT_MODEL   = "roberta-base"
+BERT_MODEL   = "bert-base-uncased"
 MAX_TOKENS   = 128
 MAX_COMMENTS = 50
 
