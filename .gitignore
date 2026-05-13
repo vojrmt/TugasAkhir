@@ -1,3 +1,6 @@
+training_history.json
+best_model.pt
+
 data/processed/
 *.csv
 *.json

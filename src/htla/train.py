@@ -24,7 +24,7 @@ parser.add_argument("--debug", action="store_true",
 # Set default path relative to train.py's location. 
 # Added a trailing slash "/" so your existing DATA_PATH + "filename.csv" code still works perfectly!
 parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/processed/"))
-parser.add_argument("--epochs",    type=int, default=20)
+parser.add_argument("--epochs",    type=int, default=30)
 parser.add_argument("--batch_size",type=int, default=5)
 parser.add_argument("--lr",          type=float, default=1e-3)
 parser.add_argument("--accum_steps", type=int,   default=8,
@@ -60,6 +60,7 @@ with open(DATA_PATH + "splits.json") as f:
 with open(DATA_PATH + "pos_weights.json") as f:
     pw          = json.load(f)
     pos_weights = torch.tensor(pw["pos_weights"], dtype=torch.float).to(DEVICE)
+    pos_weights[1] = max(pos_weights[1].item(), 0.8)
 
 # ── Datasets ──────────────────────────────────────────────────────────────────
 print("\nBuilding train dataset...")
@@ -218,6 +219,13 @@ for epoch in range(1, NUM_EPOCHS + 1):
         set_bert_trainable(False)
     elif epoch == FREEZE_EPOCHS + 1:
         set_bert_trainable(True)
+        remaining_steps = len(train_loader) * (NUM_EPOCHS - FREEZE_EPOCHS) // ACCUM_STEPS
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=50,
+            num_training_steps=remaining_steps
+        )
+        print(f"  [!] Scheduler reset for RoBERTa fine-tuning phase ({remaining_steps} steps)")
         
     model.train()
     train_loss = 0.0
