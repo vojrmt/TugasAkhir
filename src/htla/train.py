@@ -174,7 +174,6 @@ def evaluate(loader, desc="Evaluating", thresholds=None):
             total_loss += loss.item()
 
             probs = torch.sigmoid(logits).cpu().numpy()
-            print(f"Mean prob per trait: {probs.mean(axis=0).round(3)}")
 
             preds = np.stack([
                 (probs[:, i] >= thresholds[i]).astype(int)
@@ -263,10 +262,6 @@ for epoch in range(1, NUM_EPOCHS + 1):
     
     avg_metric = sum(val_results[t]["balanced_acc"] for t in TRAIT_NAMES) / 5
 
-    # Extract the current value of the trainable focal parameter (gamma)
-    # We use torch.exp because it was stored as log_gamma to keep it positive
-    current_gamma = torch.exp(criterion.log_gamma).item()
-
     print(f"\nEpoch {epoch} — train_loss: {train_loss/(step+1):.4f} "
       f"| val_loss: {val_results['loss']:.4f} | avg_bal_acc: {avg_metric:.4f}")
     
@@ -276,7 +271,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
               f"prec={r['precision']}  rec={r['recall']}")
 
     # Save gamma to history so you can plot it later if needed
-    history.append({"epoch": epoch, "val": val_results, "avg_metric": avg_metric, "gamma": current_gamma})
+    history.append({"epoch": epoch, "val": val_results, "avg_metric": avg_metric})
 
     # Early Stopping & Model Saving Logic
     if not args.debug:
