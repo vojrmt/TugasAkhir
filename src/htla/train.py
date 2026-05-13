@@ -26,7 +26,7 @@ parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/pr
 parser.add_argument("--epochs",    type=int, default=20)
 parser.add_argument("--batch_size",type=int, default=5)
 parser.add_argument("--lr",          type=float, default=1e-3)
-parser.add_argument("--accum_steps", type=int,   default=4,
+parser.add_argument("--accum_steps", type=int,   default=8,
                     help="Gradient accumulation steps. Effective batch = batch_size * accum_steps. "
                          "Default 4 gives effective batch of 16, which stabilizes extraversion "
                          "gradients (35%% positive rate is too noisy at bare batch_size=4).")
@@ -107,12 +107,13 @@ criterion = AdaptiveFocalLoss(pos_weights=pos_weights).to(DEVICE)
 # Separate LR for gamma: BERT grads are ~1e-5 scale, but gamma is a single
 # scalar that needs a much higher LR to move meaningfully.
 # Using the same LR buries gamma's gradient under BERT's parameter mass.
-optimizer = AdamW(
-    [
-        {"params": model.parameters(),     "lr": LR,     "weight_decay": 0.01},
-        {"params": criterion.parameters(), "lr": 1e-3,   "weight_decay": 0.0},
-    ]
-)
+optimizer = AdamW([
+    {"params": model.bert.parameters(),        "lr": 2e-5, "weight_decay": 0.01},
+    {"params": model.doc_encoder.parameters(), "lr": LR,   "weight_decay": 0.01},
+    {"params": model.label_attn.parameters(),  "lr": LR,   "weight_decay": 0.01},
+    {"params": model.classifiers.parameters(), "lr": LR,   "weight_decay": 0.01},
+    {"params": criterion.parameters(),         "lr": 1e-3, "weight_decay": 0.0},
+])
 
 total_steps = len(train_loader) * NUM_EPOCHS // ACCUM_STEPS
 scheduler   = get_linear_schedule_with_warmup(
@@ -206,7 +207,7 @@ print(f"\nStarting training | {len(train_loader)} batches/epoch | {NUM_EPOCHS} e
 print(f"Gradient accumulation: every {ACCUM_STEPS} steps (effective batch = {BATCH_SIZE * ACCUM_STEPS})")
 print("=" * 60)
 
-FREEZE_EPOCHS = 2
+FREEZE_EPOCHS = 5
 def set_bert_trainable(is_trainable):
     for param in model.bert.parameters():
         param.requires_grad = is_trainable
