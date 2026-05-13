@@ -4,6 +4,7 @@ import argparse
 import numpy as np
 import torch
 import pandas as pd
+from torch import nn
 from torch.utils.data import DataLoader, Subset
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
@@ -80,39 +81,38 @@ val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE,
 
 import torch.nn.functional as F
 
-class AdaptiveFocalLoss(torch.nn.Module):
-    def __init__(self, pos_weights):
-        super().__init__()
-        self.pos_weights = pos_weights
-        # Trainable gamma parameter (initialized to roughly 2.0)
-        # We use a log-parameter so we can use torch.exp() to guarantee gamma stays > 0
-        self.log_gamma = torch.nn.Parameter(torch.tensor(0.693)) 
+# class AdaptiveFocalLoss(torch.nn.Module):
+#     def __init__(self, pos_weights):
+#         super().__init__()
+#         self.pos_weights = pos_weights
+#         # Trainable gamma parameter (initialized to roughly 2.0)
+#         # We use a log-parameter so we can use torch.exp() to guarantee gamma stays > 0
+#         self.log_gamma = torch.nn.Parameter(torch.tensor(0.693)) 
 
-    def forward(self, logits, targets):
-        pure_bce    = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
-        weighted_bce = F.binary_cross_entropy_with_logits(
-            logits, targets, pos_weight=self.pos_weights, reduction='none'
-        )
-        gamma        = torch.exp(self.log_gamma)
-        focal_factor = torch.pow(1.0 - torch.exp(-pure_bce), gamma)
-        return (focal_factor * weighted_bce).mean()
+#     def forward(self, logits, targets):
+#         pure_bce    = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+#         weighted_bce = F.binary_cross_entropy_with_logits(
+#             logits, targets, pos_weight=self.pos_weights, reduction='none'
+#         )
+#         gamma        = torch.exp(self.log_gamma)
+#         focal_factor = torch.pow(1.0 - torch.exp(-pure_bce), gamma)
+#         return (focal_factor * weighted_bce).mean()
 
 # ── Model, loss, optimizer ────────────────────────────────────────────────────
 print("\nLoading model...")
 model     = HTLA(dropout=DROPOUT).to(DEVICE)
 
 # Use the new Multi-Dimensional Adaptive Focal Loss
-criterion = AdaptiveFocalLoss(pos_weights=pos_weights).to(DEVICE)
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
 
 # Separate LR for gamma: BERT grads are ~1e-5 scale, but gamma is a single
 # scalar that needs a much higher LR to move meaningfully.
 # Using the same LR buries gamma's gradient under BERT's parameter mass.
 optimizer = AdamW([
-    {"params": model.bert.parameters(),        "lr": 2e-5, "weight_decay": 0.01},
-    {"params": model.doc_encoder.parameters(), "lr": LR,   "weight_decay": 0.01},
-    {"params": model.label_attn.parameters(),  "lr": LR,   "weight_decay": 0.01},
-    {"params": model.classifiers.parameters(), "lr": LR,   "weight_decay": 0.01},
-    {"params": criterion.parameters(),         "lr": 1e-3, "weight_decay": 0.0},
+    {"params": model.bert.parameters(),        "lr": 2e-5,  "weight_decay": 0.01},
+    {"params": model.doc_encoder.parameters(), "lr": 1e-4,  "weight_decay": 0.01},
+    {"params": model.label_attn.parameters(),  "lr": 1e-4,  "weight_decay": 0.01},
+    {"params": model.classifiers.parameters(), "lr": 1e-4,  "weight_decay": 0.01},
 ])
 
 total_steps = len(train_loader) * NUM_EPOCHS // ACCUM_STEPS
@@ -198,7 +198,7 @@ def evaluate(loader, desc="Evaluating", thresholds=None):
     return results
 
 # ── Training loop ─────────────────────────────────────────────────────────────
-best_val_f1      = 0.0
+best_val_metric      = 0.0
 history          = []
 patience_counter = 0
 PATIENCE_LIMIT   = 5
@@ -243,7 +243,7 @@ for epoch in range(1, NUM_EPOCHS + 1):
         if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
             # Clip grads for BOTH model and criterion (log_gamma included)
             torch.nn.utils.clip_grad_norm_(
-                list(model.parameters()) + list(criterion.parameters()),
+                list(model.parameters()),
                 max_norm=1.0
             )
             optimizer.step()
@@ -261,14 +261,14 @@ for epoch in range(1, NUM_EPOCHS + 1):
     thresholds  = find_best_thresholds(val_loader)
     val_results = evaluate(val_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [val]", thresholds=thresholds)
     
-    avg_f1      = sum(val_results[t]["f1"] for t in TRAIT_NAMES) / 5
+    avg_metric = sum(val_results[t]["balanced_acc"] for t in TRAIT_NAMES) / 5
 
     # Extract the current value of the trainable focal parameter (gamma)
     # We use torch.exp because it was stored as log_gamma to keep it positive
     current_gamma = torch.exp(criterion.log_gamma).item()
 
     print(f"\nEpoch {epoch} — train_loss: {train_loss/(step+1):.4f} "
-          f"| val_loss: {val_results['loss']:.4f} | avg_f1: {avg_f1:.4f} | gamma: {current_gamma:.4f}")
+      f"| val_loss: {val_results['loss']:.4f} | avg_bal_acc: {avg_metric:.4f}")
     
     for trait in TRAIT_NAMES:
         r = val_results[trait]
@@ -276,21 +276,21 @@ for epoch in range(1, NUM_EPOCHS + 1):
               f"prec={r['precision']}  rec={r['recall']}")
 
     # Save gamma to history so you can plot it later if needed
-    history.append({"epoch": epoch, "val": val_results, "avg_f1": avg_f1, "gamma": current_gamma})
+    history.append({"epoch": epoch, "val": val_results, "avg_metric": avg_metric, "gamma": current_gamma})
 
     # Early Stopping & Model Saving Logic
     if not args.debug:
-        if avg_f1 > best_val_f1:
-            best_val_f1 = avg_f1
-            patience_counter = 0  # Reset patience because we improved!
+        if avg_metric > best_val_metric:
+            best_val_metric = avg_metric
+            patience_counter = 0 
             torch.save(model.state_dict(), "best_model.pt")
-            print(f"  ✓ Saved best model (avg F1 = {best_val_f1:.4f})")
+            print(f"  ✓ Saved best model (avg balanced accuracy = {best_val_metric:.4f})")
         else:
             patience_counter += 1
             print(f"  ! No improvement. Early stopping patience: {patience_counter}/{PATIENCE_LIMIT}")
             
             if patience_counter >= PATIENCE_LIMIT:
-                print(f"\n  [!] Validation F1 hasn't improved for {PATIENCE_LIMIT} epochs.")
+                print(f"\n  [!] Validation balanced accuracy hasn't improved for {PATIENCE_LIMIT} epochs.")
                 print("  [!] Early stopping triggered. Halting training to save time.")
                 break  # Kills the epoch loop
 
@@ -303,4 +303,4 @@ for epoch in range(1, NUM_EPOCHS + 1):
 if not args.debug:
     with open("training_history.json", "w") as f:
         json.dump(history, f, indent=2)
-    print(f"\nDone. Best val avg F1: {best_val_f1:.4f}")
+    print(f"\nDone. Best val avg balanced accuracy: {best_val_metric:.4f}")
