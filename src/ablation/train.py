@@ -22,6 +22,8 @@ parser.add_argument("--use_doc_encoder",  action="store_true", default=True)
 parser.add_argument("--no_doc_encoder",   dest="use_doc_encoder", action="store_false")
 parser.add_argument("--use_projection",   action="store_true", default=True)
 parser.add_argument("--no_projection",    dest="use_projection", action="store_false")
+parser.add_argument("--use_label_attn",   action="store_true", default=True)
+parser.add_argument("--no_label_attn",    dest="use_label_attn", action="store_false")
 parser.add_argument("--run_name",         default="baseline")
 parser.add_argument("--debug", action="store_true",
                     help="Run 2 batches only to verify code correctness")
@@ -110,6 +112,7 @@ model     = HTLA(
     dropout=DROPOUT,
     use_doc_encoder=args.use_doc_encoder,
     use_projection=args.use_projection,
+    use_label_attn=args.use_label_attn,
 ).to(DEVICE)
 
 # Use the new Multi-Dimensional Adaptive Focal Loss
