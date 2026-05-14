@@ -1,0 +1,318 @@
+import os
+import json
+import argparse
+import numpy as np
+import torch
+import pandas as pd
+from torch import nn
+from torch.utils.data import DataLoader, Subset
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
+from sklearn.metrics import f1_score, accuracy_score, precision_score, recall_score, balanced_accuracy_score
+from tqdm import tqdm
+from dataset import PANDORADataset
+from model import HTLA
+
+# Get the directory where train.py is located
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ── Args ──────────────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("--use_doc_encoder",  action="store_true", default=True)
+parser.add_argument("--no_doc_encoder",   dest="use_doc_encoder", action="store_false")
+parser.add_argument("--use_projection",   action="store_true", default=True)
+parser.add_argument("--no_projection",    dest="use_projection", action="store_false")
+parser.add_argument("--run_name",         default="baseline")
+parser.add_argument("--debug", action="store_true",
+                    help="Run 2 batches only to verify code correctness")
+
+# Set default path relative to train.py's location. 
+# Added a trailing slash "/" so your existing DATA_PATH + "filename.csv" code still works perfectly!
+parser.add_argument("--data_path", default=os.path.join(BASE_DIR, "../../data/processed/"))
+parser.add_argument("--epochs",    type=int, default=30)
+parser.add_argument("--batch_size",type=int, default=5)
+parser.add_argument("--lr",          type=float, default=1e-3)
+parser.add_argument("--accum_steps", type=int,   default=8,
+                    help="Gradient accumulation steps. Effective batch = batch_size * accum_steps. "
+                         "Default 4 gives effective batch of 16, which stabilizes extraversion "
+                         "gradients (35%% positive rate is too noisy at bare batch_size=4).")
+args = parser.parse_args()
+
+# ── Config ────────────────────────────────────────────────────────────────────
+DATA_PATH    = args.data_path
+BATCH_SIZE   = 2 if args.debug else args.batch_size
+NUM_EPOCHS   = 1 if args.debug else args.epochs
+LR           = args.lr
+ACCUM_STEPS  = 1 if args.debug else args.accum_steps
+WARMUP_STEPS = 100
+DROPOUT      = 0.1
+DEVICE       = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TRAIT_NAMES  = ["agreeableness", "openness", "conscientiousness",
+                "extraversion", "neuroticism"]
+
+print(f"Device: {DEVICE}")
+print(f"Debug mode: {args.debug}")
+print(f"Effective batch size: {BATCH_SIZE} x {ACCUM_STEPS} accum = {BATCH_SIZE * ACCUM_STEPS}")
+print("-" * 60)
+
+# ── Load data ─────────────────────────────────────────────────────────────────
+print("Loading data...")
+profiles = pd.read_csv(DATA_PATH + "profiles_labeled.csv")
+comments = pd.read_csv(DATA_PATH + "comments_capped.csv")
+
+with open(DATA_PATH + "splits.json") as f:
+    splits = json.load(f)
+with open(DATA_PATH + "pos_weights.json") as f:
+    pw          = json.load(f)
+    pos_weights = torch.tensor(pw["pos_weights"], dtype=torch.float).to(DEVICE)
+    pos_weights[1] = max(pos_weights[1].item(), 0.8)
+
+# ── Datasets ──────────────────────────────────────────────────────────────────
+print("\nBuilding train dataset...")
+train_dataset = PANDORADataset(splits["train"], profiles, comments)
+
+print("Building val dataset...")
+val_dataset   = PANDORADataset(splits["val"],   profiles, comments)
+
+# In debug mode: only use first 4 users from each split
+if args.debug:
+    train_dataset = Subset(train_dataset, list(range(4)))
+    val_dataset   = Subset(val_dataset,   list(range(4)))
+    print("DEBUG: using 4 users per split, 2 batches max")
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE,
+                          shuffle=True,  num_workers=0)
+val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE,
+                          shuffle=False, num_workers=0)
+
+import torch.nn.functional as F
+
+# class AdaptiveFocalLoss(torch.nn.Module):
+#     def __init__(self, pos_weights):
+#         super().__init__()
+#         self.pos_weights = pos_weights
+#         # Trainable gamma parameter (initialized to roughly 2.0)
+#         # We use a log-parameter so we can use torch.exp() to guarantee gamma stays > 0
+#         self.log_gamma = torch.nn.Parameter(torch.tensor(0.693)) 
+
+#     def forward(self, logits, targets):
+#         pure_bce    = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+#         weighted_bce = F.binary_cross_entropy_with_logits(
+#             logits, targets, pos_weight=self.pos_weights, reduction='none'
+#         )
+#         gamma        = torch.exp(self.log_gamma)
+#         focal_factor = torch.pow(1.0 - torch.exp(-pure_bce), gamma)
+#         return (focal_factor * weighted_bce).mean()
+
+# ── Model, loss, optimizer ────────────────────────────────────────────────────
+print("\nLoading model...")
+model     = HTLA(
+    dropout=DROPOUT,
+    use_doc_encoder=args.use_doc_encoder,
+    use_projection=args.use_projection,
+).to(DEVICE)
+
+# Use the new Multi-Dimensional Adaptive Focal Loss
+criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
+# Separate LR for gamma: BERT grads are ~1e-5 scale, but gamma is a single
+# scalar that needs a much higher LR to move meaningfully.
+# Using the same LR buries gamma's gradient under BERT's parameter mass.
+optimizer = AdamW([
+    {"params": model.bert.parameters(),        "lr": 2e-5,  "weight_decay": 0.01},
+    {"params": model.doc_encoder.parameters(), "lr": 1e-4,  "weight_decay": 0.01},
+    {"params": model.label_attn.parameters(),  "lr": 1e-4,  "weight_decay": 0.01},
+    {"params": model.classifiers.parameters(), "lr": 1e-4,  "weight_decay": 0.01},
+])
+
+total_steps = len(train_loader) * NUM_EPOCHS // ACCUM_STEPS
+scheduler   = get_linear_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=min(WARMUP_STEPS, total_steps),
+    num_training_steps=total_steps
+)
+
+# ── Eval ──────────────────────────────────────────────────────────────────────
+def find_best_thresholds(loader):
+    model.eval()
+    all_probs, all_labels = [], []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Calibrating thresholds", leave=False):
+            ids   = batch["input_ids"].to(DEVICE)
+            masks = batch["attention_masks"].to(DEVICE)
+            cmask = batch["comment_mask"].to(DEVICE)
+            lbls  = batch["labels"].to(DEVICE)
+            logits, _ = model(ids, masks, cmask)
+            all_probs.append(torch.sigmoid(logits).cpu().numpy())
+            all_labels.append(lbls.int().cpu().numpy())
+
+    all_probs  = np.vstack(all_probs)
+    all_labels = np.vstack(all_labels)
+
+    best_thresholds = []
+    print("\n  [Threshold Calibration Results]")
+    for i in range(len(TRAIT_NAMES)):
+        best_t, best_score = 0.5, 0.0  # fallback default
+        for t in np.arange(0.1, 0.9, 0.05):
+            preds = (all_probs[:, i] >= t).astype(int)
+            if len(np.unique(preds)) < 2:  # skip degenerate thresholds
+                continue
+            b_acc = balanced_accuracy_score(all_labels[:, i], preds)
+            if b_acc > best_score:
+                best_score, best_t = b_acc, t
+        best_thresholds.append(best_t)  # always appends, even if no t passed the guard
+        print(f"  {TRAIT_NAMES[i]:<20} best_threshold={best_t:.2f}  bal_acc={best_score:.4f}")
+
+    return best_thresholds
+
+def evaluate(loader, desc="Evaluating", thresholds=None):
+    if thresholds is None:
+        thresholds = [0.5] * len(TRAIT_NAMES)
+    model.eval()
+    all_preds, all_labels = [], []
+    total_loss = 0.0
+
+    with torch.no_grad():
+        for batch in tqdm(loader, desc=desc, leave=False):
+            ids   = batch["input_ids"].to(DEVICE)
+            masks = batch["attention_masks"].to(DEVICE)
+            cmask = batch["comment_mask"].to(DEVICE)
+            lbls  = batch["labels"].to(DEVICE)
+
+            logits, _ = model(ids, masks, cmask)
+            loss      = criterion(logits, lbls)
+            total_loss += loss.item()
+
+            probs = torch.sigmoid(logits).cpu().numpy()
+
+            preds = np.stack([
+                (probs[:, i] >= thresholds[i]).astype(int)
+                for i in range(len(TRAIT_NAMES))
+            ], axis=1)
+            all_preds.append(preds)
+            all_labels.append(lbls.int().cpu().numpy())
+
+    all_preds  = np.vstack(all_preds)
+    all_labels = np.vstack(all_labels)
+
+    results = {"loss": total_loss / len(loader)}
+    for i, trait in enumerate(TRAIT_NAMES):
+        results[trait] = {
+            "accuracy":  round(accuracy_score (all_labels[:, i], all_preds[:, i]), 4),
+            "balanced_acc": round(balanced_accuracy_score(all_labels[:, i], all_preds[:, i]), 4),
+            "f1":        round(f1_score       (all_labels[:, i], all_preds[:, i], zero_division=0), 4),
+            "precision": round(precision_score(all_labels[:, i], all_preds[:, i], zero_division=0), 4),
+            "recall":    round(recall_score   (all_labels[:, i], all_preds[:, i], zero_division=0), 4),
+        }
+    return results
+
+# ── Training loop ─────────────────────────────────────────────────────────────
+best_val_metric      = 0.0
+history          = []
+patience_counter = 0
+PATIENCE_LIMIT   = 5
+
+print(f"\nStarting training | {len(train_loader)} batches/epoch | {NUM_EPOCHS} epoch(s)")
+print(f"Gradient accumulation: every {ACCUM_STEPS} steps (effective batch = {BATCH_SIZE * ACCUM_STEPS})")
+print("=" * 60)
+
+FREEZE_EPOCHS = 5
+def set_bert_trainable(is_trainable):
+    for param in model.bert.parameters():
+        param.requires_grad = is_trainable
+    state = "UNFROZEN" if is_trainable else "FROZEN"
+    print(f"  [!] RoBERTa base model is now {state}")
+
+for epoch in range(1, NUM_EPOCHS + 1):
+    if epoch <= FREEZE_EPOCHS:
+        set_bert_trainable(False)
+    elif epoch == FREEZE_EPOCHS + 1:
+        set_bert_trainable(True)
+        remaining_steps = len(train_loader) * (NUM_EPOCHS - FREEZE_EPOCHS) // ACCUM_STEPS
+        scheduler = get_linear_schedule_with_warmup(
+            optimizer,
+            num_warmup_steps=50,
+            num_training_steps=remaining_steps
+        )
+        print(f"  [!] Scheduler reset for RoBERTa fine-tuning phase ({remaining_steps} steps)")
+        
+    model.train()
+    train_loss = 0.0
+    train_bar  = tqdm(train_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [train]")
+
+    optimizer.zero_grad() 
+
+    for step, batch in enumerate(train_bar):
+        ids   = batch["input_ids"].to(DEVICE)
+        masks = batch["attention_masks"].to(DEVICE)
+        cmask = batch["comment_mask"].to(DEVICE)
+        lbls  = batch["labels"].to(DEVICE)
+
+        logits, _ = model(ids, masks, cmask)
+        # Scale loss by accum steps so gradients average correctly
+        loss = criterion(logits, lbls) / ACCUM_STEPS
+        loss.backward()
+
+        train_loss += loss.item() * ACCUM_STEPS  # unscale for logging
+
+        # Only step when we've accumulated enough gradients
+        if (step + 1) % ACCUM_STEPS == 0 or (step + 1) == len(train_loader):
+            # Clip grads for BOTH model and criterion (log_gamma included)
+            torch.nn.utils.clip_grad_norm_(
+                list(model.parameters()),
+                max_norm=1.0
+            )
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+
+        train_bar.set_postfix(loss=f"{train_loss/(step+1):.4f}")
+
+        # Debug mode: stop after 2 batches
+        if args.debug and step >= 1:
+            print("\nDEBUG: 2 batches completed successfully. Stopping train loop.")
+            break
+
+    print("\n  Calibrating thresholds on val set...")
+    thresholds  = find_best_thresholds(val_loader)
+    val_results = evaluate(val_loader, desc=f"Epoch {epoch}/{NUM_EPOCHS} [val]", thresholds=thresholds)
+    
+    avg_metric = sum(val_results[t]["balanced_acc"] for t in TRAIT_NAMES) / 5
+
+    print(f"\nEpoch {epoch} — train_loss: {train_loss/(step+1):.4f} "
+      f"| val_loss: {val_results['loss']:.4f} | avg_bal_acc: {avg_metric:.4f}")
+    
+    for trait in TRAIT_NAMES:
+        r = val_results[trait]
+        print(f"  {trait:<20} acc={r['accuracy']}  bal_acc={r['balanced_acc']}  f1={r['f1']}  "
+              f"prec={r['precision']}  rec={r['recall']}")
+
+    # Save gamma to history so you can plot it later if needed
+    history.append({"epoch": epoch, "val": val_results, "avg_metric": avg_metric})
+
+    # Early Stopping & Model Saving Logic
+    if not args.debug:
+        if avg_metric > best_val_metric:
+            best_val_metric = avg_metric
+            patience_counter = 0 
+            torch.save(model.state_dict(), "best_model.pt")
+            print(f"  ✓ Saved best model (avg balanced accuracy = {best_val_metric:.4f})")
+        else:
+            patience_counter += 1
+            print(f"  ! No improvement. Early stopping patience: {patience_counter}/{PATIENCE_LIMIT}")
+            
+            if patience_counter >= PATIENCE_LIMIT:
+                print(f"\n  [!] Validation balanced accuracy hasn't improved for {PATIENCE_LIMIT} epochs.")
+                print("  [!] Early stopping triggered. Halting training to save time.")
+                break  # Kills the epoch loop
+
+    print("-" * 60)
+
+    if args.debug:
+        print("\nDEBUG run complete. No errors. Code is ready for GPU.")
+        break
+
+if not args.debug:
+    with open("training_history.json", "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"\nDone. Best val avg balanced accuracy: {best_val_metric:.4f}")
